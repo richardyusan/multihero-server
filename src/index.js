@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { regionHint } from "./regions.js";
 
 const MAX_PLAYERS = 4;
 const MIN_PLAYERS_TO_START = 2;
@@ -7,16 +8,28 @@ const RATE_PER_SEC = 30;
 const BURST = 40;
 const MAX_DROPS = 300;
 
+// rooms are placed in the region of their server (first letter of the code), see regions.js
+function roomStub(env, code) {
+  const id = env.ROOM.idFromName(code);
+  const hint = regionHint(code);
+  return hint ? env.ROOM.get(id, { locationHint: hint }) : env.ROOM.get(id);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // GET /where/<CODE>: data center the room runs in (to check the regions)
+    const w = url.pathname.match(/^\/where\/([A-Za-z0-9]{4,8})$/);
+    if (w) {
+      const code = w[1].toUpperCase();
+      return roomStub(env, code).fetch(new Request("https://room.internal/where?code=" + code));
+    }
     const m = url.pathname.match(/^\/room\/([A-Za-z0-9]{4,8})$/);
     if (!m) return new Response("Multihero server OK");
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket", { status: 426 });
     }
-    const stub = env.ROOM.get(env.ROOM.idFromName(m[1].toUpperCase()));
-    return stub.fetch(request);
+    return roomStub(env, m[1].toUpperCase()).fetch(request);
   },
 };
 
@@ -38,6 +51,7 @@ export class Room extends DurableObject {
   }
 
   async fetch(request) {
+    if (new URL(request.url).pathname === "/where") return this.where(request);
     const list = this.players();
     if (list.length === 0) this.started = false;
     if (this.started) return new Response("Game already started", { status: 409 });
@@ -59,6 +73,20 @@ export class Room extends DurableObject {
     server.send(JSON.stringify({ t: "welcome", id: pid, slot, host, players: all }));
     this.broadcast({ t: "join", id: pid, slot }, server);
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // the colo of a request made from inside the object = the data center it runs in
+  async where(request) {
+    const code = new URL(request.url).searchParams.get("code") || "";
+    let colo = "?";
+    try {
+      const t = await (await fetch("https://cloudflare.com/cdn-cgi/trace")).text();
+      const c = t.match(/^colo=(\w+)/m);
+      if (c) colo = c[1];
+    } catch {}
+    return new Response(JSON.stringify({ code, hint: regionHint(code) || null, colo, players: this.players().length }), {
+      headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+    });
   }
 
   allow(pid) {
